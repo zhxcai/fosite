@@ -23,11 +23,11 @@ package oauth2
 
 import (
 	"context"
+	"strings"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/ory/fosite"
+	"github.com/pkg/errors"
 )
 
 type RefreshTokenGrantHandler struct {
@@ -59,12 +59,14 @@ func (c *RefreshTokenGrantHandler) HandleTokenEndpointRequest(ctx context.Contex
 
 	refresh := request.GetRequestForm().Get("refresh_token")
 	signature := c.RefreshTokenStrategy.RefreshTokenSignature(refresh)
+	realToken, _ := getPersistRefreshToken(refresh)
+
 	originalRequest, err := c.TokenRevocationStorage.GetRefreshTokenSession(ctx, signature, request.GetSession())
 	if errors.Cause(err) == fosite.ErrNotFound {
 		return errors.WithStack(fosite.ErrInvalidRequest.WithDebug(err.Error()))
 	} else if err != nil {
 		return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
-	} else if err := c.RefreshTokenStrategy.ValidateRefreshToken(ctx, originalRequest, refresh); err != nil {
+	} else if err := c.RefreshTokenStrategy.ValidateRefreshToken(ctx, originalRequest, realToken); err != nil {
 		// The authorization server MUST ... validate the refresh token.
 		// This needs to happen after store retrieval for the session to be hydrated properly
 		return errors.WithStack(fosite.ErrInvalidRequest.WithDebug(err.Error()))
@@ -118,27 +120,43 @@ func (c *RefreshTokenGrantHandler) PopulateTokenEndpointResponse(ctx context.Con
 		return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
 	}
 
-	refreshToken, refreshSignature, err := c.RefreshTokenStrategy.GenerateRefreshToken(ctx, requester)
-	if err != nil {
-		return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
+	newSignature := ""
+	refreshToken := requester.GetRequestForm().Get("refresh_token")
+	signature := c.RefreshTokenStrategy.RefreshTokenSignature(refreshToken)
+
+	_, persist := getPersistRefreshToken(refreshToken)
+	if !persist {
+		refreshToken, newSignature, err = c.RefreshTokenStrategy.GenerateRefreshToken(ctx, requester)
+		if err != nil {
+			return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
+		}
+		if strings.EqualFold(requester.GetRequestForm().Get("persist"), "yes") {
+			newSignature = toPersistRefreshToken(newSignature)
+			refreshToken = toPersistRefreshToken(refreshToken)
+		}
 	}
 
-	signature := c.RefreshTokenStrategy.RefreshTokenSignature(requester.GetRequestForm().Get("refresh_token"))
 	ts, err := c.TokenRevocationStorage.GetRefreshTokenSession(ctx, signature, nil)
 	if err != nil {
 		return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
 	} else if err := c.TokenRevocationStorage.RevokeAccessToken(ctx, ts.GetID()); err != nil {
 		return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
-	} else if err := c.TokenRevocationStorage.RevokeRefreshToken(ctx, ts.GetID()); err != nil {
-		return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
+	}
+	if len(newSignature) > 0 {
+		if err = c.TokenRevocationStorage.RevokeRefreshToken(ctx, ts.GetID()); err != nil {
+			return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
+		}
 	}
 
 	storeReq := requester.Sanitize([]string{})
 	storeReq.SetID(ts.GetID())
 	if err := c.TokenRevocationStorage.CreateAccessTokenSession(ctx, accessSignature, storeReq); err != nil {
 		return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
-	} else if err := c.TokenRevocationStorage.CreateRefreshTokenSession(ctx, refreshSignature, storeReq); err != nil {
-		return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
+	}
+	if len(newSignature) > 0 {
+		if err := c.TokenRevocationStorage.CreateRefreshTokenSession(ctx, newSignature, storeReq); err != nil {
+			return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
+		}
 	}
 
 	responder.SetAccessToken(accessToken)
@@ -147,4 +165,19 @@ func (c *RefreshTokenGrantHandler) PopulateTokenEndpointResponse(ctx context.Con
 	responder.SetScopes(requester.GetGrantedScopes())
 	responder.SetExtra("refresh_token", refreshToken)
 	return nil
+}
+
+var (
+	persistValue = "-persist"
+)
+
+func getPersistRefreshToken(token string) (string, bool) {
+	if strings.HasSuffix(token, persistValue) {
+		return token[0 : len(token)-len(persistValue)], true
+	}
+	return token, false
+}
+
+func toPersistRefreshToken(token string) string {
+	return strings.Join([]string{token, persistValue}, "")
 }
