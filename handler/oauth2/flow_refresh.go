@@ -23,6 +23,8 @@ package oauth2
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"strings"
 	"time"
 
@@ -123,14 +125,18 @@ func (c *RefreshTokenGrantHandler) PopulateTokenEndpointResponse(ctx context.Con
 	newSignature := ""
 	refreshToken := requester.GetRequestForm().Get("refresh_token")
 	signature := c.RefreshTokenStrategy.RefreshTokenSignature(refreshToken)
+	// TODO: the behavior extensions don't support for access token, it only work
+	// for openid token, the access token should be revoked every request
+	behavior := requester.GetRequestForm().Get("behavior")
 
+	// if refresh_token is not persisted, need to grant new refresh_token
 	_, persist := getPersistRefreshToken(refreshToken)
 	if !persist {
 		refreshToken, newSignature, err = c.RefreshTokenStrategy.GenerateRefreshToken(ctx, requester)
 		if err != nil {
 			return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
 		}
-		if strings.EqualFold(requester.GetRequestForm().Get("persist"), "yes") {
+		if strings.EqualFold(behavior, behaviorPersist) {
 			newSignature = toPersistRefreshToken(newSignature)
 			refreshToken = toPersistRefreshToken(refreshToken)
 		}
@@ -142,17 +148,29 @@ func (c *RefreshTokenGrantHandler) PopulateTokenEndpointResponse(ctx context.Con
 	} else if err := c.TokenRevocationStorage.RevokeAccessToken(ctx, ts.GetID()); err != nil {
 		return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
 	}
-	if len(newSignature) > 0 {
+
+	// Use persisted refresh_token to exchange access token, it should not be grant
+	// new fresh_token, if granted new refresh_token, it should to revoke old one.
+	// but if the behavior is derive new one, should don't revoke old one
+	if len(newSignature) > 0 && !strings.EqualFold(behavior, behaviorDerive) {
 		if err = c.TokenRevocationStorage.RevokeRefreshToken(ctx, ts.GetID()); err != nil {
 			return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
 		}
 	}
 
 	storeReq := requester.Sanitize([]string{})
-	storeReq.SetID(ts.GetID())
+	requestID := ts.GetID()
+	// if derived a new refresh_token, the old on not be revoke, so the id is duplicated
+	if strings.EqualFold(behavior, behaviorDerive) {
+		if requestID, err = incrementString(requestID, deriveValue); err != nil {
+			return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
+		}
+	}
+	storeReq.SetID(requestID)
 	if err := c.TokenRevocationStorage.CreateAccessTokenSession(ctx, accessSignature, storeReq); err != nil {
 		return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
 	}
+	// if granted new refresh_token, should save it to db
 	if len(newSignature) > 0 {
 		if err := c.TokenRevocationStorage.CreateRefreshTokenSession(ctx, newSignature, storeReq); err != nil {
 			return errors.WithStack(fosite.ErrServerError.WithDebug(err.Error()))
@@ -168,7 +186,10 @@ func (c *RefreshTokenGrantHandler) PopulateTokenEndpointResponse(ctx context.Con
 }
 
 var (
-	persistValue = "-persist"
+	persistValue    = "-persist"
+	deriveValue     = "-"
+	behaviorPersist = "persist"
+	behaviorDerive  = "derive"
 )
 
 func getPersistRefreshToken(token string) (string, bool) {
@@ -180,4 +201,21 @@ func getPersistRefreshToken(token string) (string, bool) {
 
 func toPersistRefreshToken(token string) string {
 	return strings.Join([]string{token, persistValue}, "")
+}
+func incrementString(str string, separator string) (string, error) {
+	// set default values
+	if separator == "" {
+		separator = "_"
+	}
+	start := time.Date(2018, 12, 1, 0, 0, 0, 0, time.UTC)
+	d := time.Now().Sub(start)
+	bs := make([]byte, 4)
+	binary.LittleEndian.PutUint32(bs, uint32(d.Seconds()))
+	diff := base64.RawURLEncoding.EncodeToString(bs)
+	// test to see if str already has integer suffix(ends with _%s)
+	test := strings.SplitN(str, separator, 2)
+	if len(test) >= 2 {
+		return test[0] + separator + diff, nil
+	}
+	return str + separator + diff, nil
 }
